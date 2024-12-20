@@ -1,0 +1,198 @@
+library(haven)#加载dta格式数据
+library(tidyverse)#加载数据处理包
+mimic_data <- read_dta("MIMIC-IV-sepsis.dta")
+eICU_data <- read_dta("eICU-CRD-sepsis.dta")
+
+#筛选AKI患者
+mimic_sad_aki <- mimic_data %>% filter(aki==1)
+
+
+#对缺失值进行数据插补
+library(mice)#使用mice包进行数据多重插补
+mimic_sad_aki <- mimic_sad_aki[,-1]#多重插补不能有患者ID以及编号之类的数据，需要剔除
+mimic_sad_aki <- mice(mimic_sad_aki,m=5,maxit = 10,method = "pmm",seed = 123,print = FALSE)#设置种子，不输出过程
+mimic_sad_aki <- mice::complete(mimic_sad_aki)
+
+
+#整理数据（以sad为应变量（放在第一列），减少不需要的临床特征）
+mimic_sad_aki <- mimic_sad_aki %>% select(-c(race,first_careunit,deliriumtime,sepsistime,icu28dmort,aki)) %>% select(sad,everything())
+
+
+#转换ICU住院时间从小时到天
+hosp_d <- round(mimic_sad_aki$hospstay/24)
+mimic_sad_aki <- data.frame(mimic_sad_aki,hosp_d)
+
+#输出表1（tableone）
+library(tableone)
+library(survival)
+#分类变量转换
+dput(names(mimic_sad_aki))#获取变量名
+#纳入变量定义（排除ID及不需要的变量）
+myvars <- c("sad","age", "weight", "gender", "temperature", "heart_rate", 
+            "resp_rate", "spo2", "sbp", "dbp", "mbp", "wbc", "hemoglobin", 
+            "platelet", "bun", "cr", "glu", "Na", "Cl", "K", "Mg", "Ca", 
+            "P", "inr", "pt", "ptt", "bicarbonate", "aniongap", "gcs", "vent", 
+            "crrt", "vaso", "seda", "sofa_score", "ami", "ckd", "copd", "hyperte", 
+            "dm", "stroke")
+#分类变量定义
+catvars <- c("gender", "vent", "crrt", "vaso", "seda", "ami", "ckd", "copd", "hyperte", 
+             "dm", "sad", "stroke")
+#分组汇总+偏态数据使用中位数表示
+tab1 <- CreateTableOne(vars = myvars,strata = "sad",data = mimic_sad_aki,factorVars = catvars)
+tableone_01 <- print(tab1,nonnormal = TRUE,quote = FALSE,noSpaces = TRUE,printToggle = FALSE)
+write.csv(tableone_01,file="tableone_01.csv")
+
+
+
+#进行LASSO回归筛选特征值并可视化结果
+mimic_sad_aki_lasso <- mimic_sad_aki %>% select(-c(hosp_mort,icustay,hospstay,hosp_d))
+set.seed(123)
+library(glmnet)
+colnames(mimic_sad_aki_lasso[,1:40])#查看前40列的列名（根据自己的数据调整）
+y <- as.matrix(mimic_sad_aki_lasso[,1])#提取第一列作为结局（建议结局放在第一列）
+x <- as.matrix(mimic_sad_aki_lasso[,2:40])#第2列至第40列作为自变量
+
+#后边的代码除了s值基本不需更改
+lasso_model <- glmnet(x,y,family = "binomial",
+                      alpha = 1)#表示采用L1正则化，即Lasso回归
+max(lasso_model$lambda)
+print(lasso_model)
+#绘制LASSO图
+plot(lasso_model,
+     xvar="lambda")
+
+#交叉验证并绘制可视化结果
+cv_model <- cv.glmnet(x,y,family="binomial",alpha=1,nfolds = 10)
+plot(cv_model)
+
+#根据交叉验证结果，选择lambda值，lambda.min或lambda.1se
+lambda_min <- cv_model$lambda.min
+lambda_min
+lambda_1se <- cv_model$lambda.1se
+lambda_1se
+
+#s为Lambda大小，Lambda越大表示模型的正则化强度越大，选择的自变量也越少。
+#这里选择的是刚刚得到的lambda.1se的值
+coef_lasso <- coef(lasso_model,s=lambda_1se)
+coef_lasso
+#结果显示后边带有数值的变量为筛选得到的变量
+
+#根据LASSO回归结果筛选特征变量（即特征后面带有数值的变量）
+mimic_ML <- mimic_sad_aki_lasso %>% select(c(sad,age,weight,temperature,heart_rate,
+                                             resp_rate,spo2,dbp,wbc,hemoglobin,platelet,
+                                             bun,cr,glu,Na,K,Mg,Ca,P,
+                                             aniongap,gcs,vent,crrt,
+                                             vaso,seda,sofa_score,ami,ckd,
+                                             copd,dm,stroke))
+#eICU_ML <- eICU_com_LASSO %>% select(c(hosp_mort,age,weight,temperature,heart_rate,
+#                                       resp_rate,spo2,sbp,wbc,
+#                                       hemoglobin,bun,cr,glu,
+#                                       Cl,P,inr,ptt,
+#                                       aniongap,gcs,vent,crrt,
+#                                       seda,sofa_score,sad,aki,stroke))
+
+
+
+library(caret)
+mimic_sad_aki_ml <- mimic_ML
+set.seed(666)
+index <- createDataPartition(mimic_sad_aki_ml$sad,p=0.7,list = F)
+train <- mimic_sad_aki_ml[index,]
+test <- mimic_sad_aki_ml[-index,]
+
+#将训练集中的相应列转换为因子类型
+train$sad <- as.factor(as.character(train$sad))
+train$vent <- as.factor(train$vent)
+train$crrt <- as.factor(train$crrt)
+train$vaso <- as.factor(train$vaso)
+train$seda <- as.factor(train$seda)
+train$ami <- as.factor(train$ami)
+train$ckd <- as.factor(train$ckd)
+train$copd <- as.factor(train$copd)
+train$dm <- as.factor(train$dm)
+train$stroke <- as.factor(train$stroke)
+str(train)
+
+#将测试集中的相应列转换为因子类型
+test$sad <- as.factor(as.character(test$sad))
+test$vent <- as.factor(test$vent)
+test$crrt <- as.factor(test$crrt)
+test$vaso <- as.factor(test$vaso)
+test$seda <- as.factor(test$seda)
+test$ami <- as.factor(test$ami)
+test$ckd <- as.factor(test$ckd)
+test$copd <- as.factor(test$copd)
+test$dm <- as.factor(test$dm)
+test$stroke <- as.factor(test$stroke)
+str(test)
+
+
+#LR model
+lm_model <- glm(sad~.,data = train,family = binomial(link = "logit"))
+summary(lm_model)
+lm_pred <- predict(lm_model,test,type="response")
+threshold <- 0.5
+predictions_binary <- ifelse(lm_pred>threshold,1,0)
+confusionMatrix(as.factor(predictions_binary),as.factor(test$sad))
+LR_pred <- predictions_binary
+
+#SVM model
+library(e1071)
+svm_model <- svm(sad ~ ., data = train, probability = TRUE)
+svm_pred <- predict(svm_model, test, probability = TRUE)
+a <- data.frame(svm_pred)
+ab <- as.factor(as.character(a$svm_pred))
+svm_sad <- as.factor(test$sad)
+svm_pred_prob <- attr(svm_pred, "probabilities")[, 2]
+confusionMatrix(data = ab, reference = svm_sad)
+train$sad <- as.numeric(as.character(train$sad)) 
+test$sad <- as.numeric(as.character(test$sad)) 
+SVM_pred <- as.numeric(a$svm_pred)
+
+#XGBoost model
+library(xgboost)
+train_matrix <- xgb.DMatrix(data.matrix(train[,-1]),label = train$sad)
+test_matrix <- xgb.DMatrix(data.matrix(test[,-1]),label = test$sad)
+params <- list(objective = "binary:logistic",eval_metric="logloss",max_depth=3,eta = 0.1,
+               gamma=0.5,colsample_bytree = 1,min_child_weight=1,subsample=0.5)
+watchlist <- list(train = train_matrix,val=test_matrix)
+xgb_model <- xgb.train(params = params,data = train_matrix,nrounds = 125,watchlist = watchlist,
+                       early_stopping_rounds = 10,print_every_n = 10,maximize = FALSE)
+xgb_pred_prob <- predict(xgb_model,test_matrix)
+xgb_pred <- ifelse(xgb_pred_prob > 0.5,1,0)
+xgb_pred_factor <- factor(xgb_pred,levels = c(0,1))
+test_sad_factor <- factor(test$sad,levels = c(0,1))
+confusionMatrix(data = xgb_pred_factor,reference=test_sad_factor)
+
+#RF model（随机森林）
+library(randomForest)
+train$sad <- as.factor(train$sad)
+test$sad <- as.factor(test$sad)
+rf_model <- randomForest(sad~.,data = train,ntree = 500,mtry = 6)
+rf_pred <- predict(rf_model,newdata = test)
+confusionMatrix(data = rf_pred,reference = test$sad)
+
+#DT model(决策树)
+library(rpart)
+dt_model <- rpart(sad~.,data = train,method = "class")
+dt_pred_prob <- predict(dt_model,newdata = test,type="prob")[,2]
+dt_pred <- ifelse(dt_pred_prob > 0.5,1,0)
+confusionMatrix(factor(dt_pred,levels = c("0","1")),test$sad)
+
+#NB model(朴素贝叶斯)
+library(e1071)
+nb_model <- naiveBayes(sad~.,data = train)
+nb_pred_prob <- predict(nb_model,newdata = test,type="raw")[,2]
+nb_pred <- ifelse(nb_pred_prob > 0.5,1,0)
+confusionMatrix(factor(nb_pred,levels = c("0","1")),test$sad)
+
+
+#KNN model(K最近邻回归)
+library(kknn)
+knn_model <- kknn(sad~.,train,test,k=10,distance = 2,kernel = "rectangular")
+knn_pred_prob <- predict(knn_model,newdata=test,type="prob")
+knn_pred_prob <- knn_pred_prob[,"1"]
+knn_pred_prob <- as.numeric(knn_pred_prob)
+threshold <- 0.5
+knn_pred <- ifelse(knn_pred_prob > threshold,1,0)
+confusionMatrix(factor(knn_pred,levels = c("0","1")),test$sad)
